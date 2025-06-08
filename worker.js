@@ -1,91 +1,60 @@
-// VLESS Cloudflare Worker Proxy (Open UUID - Semua UUID diterima)
-
 addEventListener('fetch', event => {
   event.respondWith(handleRequest(event.request));
 });
 
-async function handleRequest(request) {
-  if (request.headers.get('Upgrade') === 'websocket') {
-    const [client, server] = Object.values(new WebSocketPair());
-    vlessOverWS(server);
-    return new Response(null, { status: 101, webSocket: client });
-  } else {
-    return new Response('VLESS Cloudflare Worker Proxy\n', { status: 200 });
-  }
+/**
+ * Parse path seperti /proxy/178.128.80.43-443 jadi { host: '178.128.80.43', port: 443 }
+ */
+function parseBackend(path) {
+  // Contoh path: /proxy/178.128.80.43-443
+  const match = path.match(/^\/proxy\/([\d\.]+)-(\d+)$/);
+  if (!match) return null;
+  return { host: match[1], port: parseInt(match[2], 10) };
 }
 
-async function vlessOverWS(ws) {
-  ws.accept();
+async function handleRequest(request) {
+  const url = new URL(request.url);
 
-  let handshake = new Uint8Array();
-  let connected = false;
+  // Hanya support upgrade ke WebSocket
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return new Response("Only WebSocket proxy supported!", { status: 400 });
+  }
 
-  ws.addEventListener('message', async event => {
-    if (connected) return;
-    let data = new Uint8Array(event.data);
-    handshake = concatUint8Array(handshake, data);
+  // Parsing backend dari path
+  const backend = parseBackend(url.pathname);
+  if (!backend) {
+    return new Response("Invalid path. Use /proxy/IP-PORT", { status: 404 });
+  }
 
-    if (handshake.length < 24) return; // Minimal handshake VLESS
+  // Membuka WebSocket ke client
+  const [clientWs, serverWs] = Object.values(new WebSocketPair());
 
-    // Tidak ada validasi UUID, semua UUID diterima!
+  // Relay WebSocket dari client ke backend
+  connectBackend(serverWs, backend.host, backend.port);
 
-    // Parse address
-    const addrType = handshake[21];
-    let addr = "";
-    let offset = 22;
-    if (addrType === 1) { // IPv4
-      addr = [...handshake.slice(offset, offset+4)].join(".");
-      offset += 4;
-    } else if (addrType === 2) { // domain
-      const len = handshake[offset];
-      offset += 1;
-      addr = new TextDecoder().decode(handshake.slice(offset, offset+len));
-      offset += len;
-    } else if (addrType === 3) { // IPv6
-      addr = [...Array(8).keys()].map(i =>
-        handshake[offset+i*2].toString(16).padStart(2,"0") +
-        handshake[offset+i*2+1].toString(16).padStart(2,"0")
-      ).join(":");
-      offset += 16;
-    } else {
-      ws.send("invalid addrType");
-      ws.close();
-      return;
-    }
-    const port = (handshake[offset]<<8) + handshake[offset+1];
-    offset += 2;
-
-    // Connect to target (NOTE: Worker free hanya support fetch ke port 80/443)
-    let response, targetStream;
-    try {
-      const url = `https://${addr}:${port}`;
-      response = await fetch(url);
-      targetStream = response.body.getReader();
-    } catch {
-      ws.send("connect failed");
-      ws.close();
-      return;
-    }
-
-    // Relay: (hanya satu arah demo, sebenarnya perlu duplex stream)
-    ws.send("connected demo (fetch only)");
-
-    // Demo: kirim data dari target (HTTP) ke client
-    (async () => {
-      while (true) {
-        const {done, value} = await targetStream.read();
-        if (done) break;
-        ws.send(value);
-      }
-      ws.close();
-    })();
-
-    connected = true;
+  return new Response(null, {
+    status: 101,
+    webSocket: clientWs
   });
 }
 
-function concatUint8Array(a, b) {
-  let out = new Uint8Array(a.length + b.length);
-  out.set(a, 0); out.set(b, a.length);
-  return out;
+/**
+ * Buka koneksi TCP ke backend dan relay data antar client <-> backend
+ */
+async function connectBackend(ws, host, port) {
+  ws.accept();
+  const tcp = await connect(host, port);
+
+  // Relay data dari backend ke client
+  tcp.readable.pipeTo(ws.writable).catch(() => { ws.close(); });
+  // Relay data dari client ke backend
+  ws.readable.pipeTo(tcp.writable).catch(() => { tcp.close(); });
+}
+
+/**
+ * Membuka koneksi TCP ke backend proxy (Cloudflare Workers API)
+ */
+function connect(host, port) {
+  // Cloudflare Workers API for TCP socket (fetch with "connect" scheme)
+  return fetch(`tcp://${host}:${port}`);
 }
